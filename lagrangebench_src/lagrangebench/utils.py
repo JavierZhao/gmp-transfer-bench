@@ -133,33 +133,73 @@ def get_num_params(params):
     return sum(np.prod(p.shape) for p in jax.tree_leaves(params))
 
 
+def _extract_flops(cost) -> int:
+    """Extract FLOPs from XLA/JAX cost_analysis outputs."""
+    if cost is None:
+        return None
+
+    if isinstance(cost, (int, float)):
+        return int(cost)
+
+    if isinstance(cost, dict):
+        for key in ("flops", "flop_count", "floating_point_operations"):
+            val = cost.get(key)
+            if val is not None:
+                return int(val)
+
+        total = 0.0
+        found = False
+        for value in cost.values():
+            flops = _extract_flops(value)
+            if flops is not None:
+                total += float(flops)
+                found = True
+        if found:
+            return int(total)
+        return None
+
+    if isinstance(cost, (list, tuple)):
+        total = 0.0
+        found = False
+        for item in cost:
+            flops = _extract_flops(item)
+            if flops is not None:
+                total += float(flops)
+                found = True
+        if found:
+            return int(total)
+
+    return None
+
+
 def get_forward_flops(model_apply_jit, params, state, sample):
     """Estimate FLOPs for one forward pass via JAX/XLA cost analysis.
 
     Returns:
         int FLOPs if available, otherwise None.
     """
+    lowered = None
     try:
         lowered = model_apply_jit.lower(params, state, sample)
-        cost = lowered.cost_analysis()
     except Exception:
         return None
 
-    if isinstance(cost, dict):
-        flops = cost.get("flops", cost.get("flop_count"))
-        return int(flops) if flops is not None else None
+    # Prefer lightweight lowered cost analysis first.
+    try:
+        flops = _extract_flops(lowered.cost_analysis())
+        if flops is not None:
+            return flops
+    except Exception:
+        pass
 
-    if isinstance(cost, (list, tuple)):
-        total = 0.0
-        found = False
-        for item in cost:
-            if isinstance(item, dict):
-                val = item.get("flops", item.get("flop_count"))
-                if val is not None:
-                    total += float(val)
-                    found = True
-        if found:
-            return int(total)
+    # Fallback: compiled executable cost analysis works on some backends/builds.
+    try:
+        compiled = lowered.compile()
+        flops = _extract_flops(compiled.cost_analysis())
+        if flops is not None:
+            return flops
+    except Exception:
+        pass
 
     return None
 
