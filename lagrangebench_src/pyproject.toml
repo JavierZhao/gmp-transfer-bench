@@ -1,0 +1,115 @@
+[tool.poetry]
+name = "lagrangebench"
+version = "0.2.0"
+description = "LagrangeBench: A Lagrangian Fluid Mechanics Benchmarking Suite"
+authors = [
+    "Artur Toshev, Gianluca Galletti <artur.toshev@tum.de>"
+]
+license = "MIT"
+readme = "README.md"
+homepage = "https://lagrangebench.readthedocs.io/"
+documentation = "https://lagrangebench.readthedocs.io/"
+repository = "https://github.com/tumaer/lagrangebench"
+keywords = [
+    "smoothed-particle-hydrodynamics",
+    "benchmark-suite",
+    "lagrangian-dynamics",
+    "graph-neural-networks",
+    "lagrangian-particles",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Physics",
+    "Topic :: Scientific/Engineering :: Hydrology",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+]
+
+[tool.poetry.dependencies]
+python = ">=3.9,<=3.11"
+cloudpickle = ">=2.2.1"
+h5py = ">=3.9.0"
+PyYAML = ">=6.0"
+numpy = ">=1.24.4"
+wandb = ">=0.15.11"
+pyvista = ">=0.42.2"
+jax = {version = "0.4.29", extras = ["cpu"]}
+jaxlib = "0.4.29"
+dm-haiku = ">=0.0.10"
+e3nn-jax = "0.20.3"
+jmp = ">=0.0.4"
+jraph = "0.0.6.dev0"
+optax = "0.1.7"
+ott-jax = ">=0.4.2"
+matscipy = ">=0.8.0"
+torch = {version = "2.3.1+cpu", source = "torchcpu"}
+wget = ">=3.2"
+omegaconf = ">=2.3.0"
+jax-sph = ">=0.0.3"
+
+[tool.poetry.group.dev.dependencies]
+# mypy = ">=1.8.0" - consider in the future
+pre-commit = ">=3.3.1"
+pytest = ">=7.3.1"
+pytest-cov = ">=4.1.0"
+ruff = "0.2.2"
+ipykernel = ">=6.25.1"
+
+[tool.poetry.group.docs.dependencies]
+sphinx = "7.2.6"
+sphinx-rtd-theme = "1.3.0"
+toml = ">=0.10.2"
+
+[[tool.poetry.source]]
+name = "torchcpu"
+url = "https://download.pytorch.org/whl/cpu"
+priority = "explicit"
+
+[tool.ruff]
+exclude = [
+    ".git",
+    ".venv",
+    "venv",
+    "docs/_build",
+    "dist",
+    "notebooks",
+]
+show-fixes = true
+line-length = 88
+
+[tool.ruff.lint]
+ignore = ["F811", "E402"]
+select = [
+    "E", # pycodestyle
+    "F", # Pyflakes
+    "SIM", # flake8-simplify
+    "I", # isort
+    # "D", # pydocstyle - consider in the future
+]
+
+[tool.ruff.lint.isort]
+known-third-party = ["wandb"]
+
+[tool.pytest.ini_options]
+testpaths = "tests/"
+addopts = "--cov=lagrangebench --cov-fail-under=50"
+filterwarnings = [
+    # ignore all deprecation warnings except from lagrangebench
+    "ignore::DeprecationWarning:^(?!.*lagrangebench).*"
+]
+
+# Install bumpversion with: pip install -U poetry-bumpversion
+# Use: poetry version {major|minor|patch}
+[tool.poetry_bumpversion.file."lagrangebench/__init__.py"]
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"

@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: part-pod
+  labels:
+    app: part
+spec:
+  containers:
+  - name: container
+    image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+    command: ["/bin/bash", "-c", "sleep infinity"]
+    resources:
+      limits:
+        nvidia.com/gpu: "1"
+        cpu: "8"
+        memory: "16Gi"
+    volumeMounts:
+    - mountPath: /part-vol-3
+      name: part-vol-3
+  volumes:
+    - name: part-vol-3
+      persistentVolumeClaim:
+        claimName: part-vol-3
+  nodeSelector:
+    topology.kubernetes.io/region: us-central

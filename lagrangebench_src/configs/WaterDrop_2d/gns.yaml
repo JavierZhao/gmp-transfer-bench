@@ -1,0 +1,19 @@
+extends: LAGRANGEBENCH_DEFAULTS
+
+dataset:
+  src: /tmp/datasets/WaterDrop
+
+model: 
+  name: gns
+  num_mp_steps: 10
+  latent_dim: 128
+
+train:
+  optimizer:
+    lr_start: 5.e-4
+
+logging:
+  wandb_project: waterdrop_2d
+
+neighbors:
+  backend: matscipy

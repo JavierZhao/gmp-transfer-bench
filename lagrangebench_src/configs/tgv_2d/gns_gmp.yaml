@@ -1,0 +1,7 @@
+extends: configs/tgv_2d/gns.yaml
+
+model:
+  use_gmp: True
+  gmp_kernel: 3
+  gmp_grid_bins: 64
+  gmp_reduce: sum

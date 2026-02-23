@@ -1,0 +1,10 @@
+extends: LAGRANGEBENCH_DEFAULTS
+
+dataset:
+  src: datasets/2D_DAM_5740_20kevery100
+
+logging:
+  wandb_project: dam_2d
+
+neighbors:
+  multiplier: 2.0

@@ -1,0 +1,38 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: morepairattnpart-data100m-job
+  labels:
+    jobgroup: part-job
+spec:
+  template:
+    spec:
+      containers:
+      - name: training
+        image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+        command: ["/bin/bash"]
+        args:
+        - -c
+        - >-
+            cd /part-vol-3/weaver-core &&
+            pip install -e . &&
+            cd /part-vol-3/weaver-core/particle_transformer &&
+            ./train_JetClass.sh MorePairAttnParT full --batch-size 512 --gpus 0,1,2,3 --num-workers 2
+        volumeMounts:
+        - mountPath: /part-vol-3
+          name: part-vol-3
+        resources:
+          limits:
+            memory: 128Gi
+            cpu: "64"
+            nvidia.com/gpu: "4"
+          requests:
+            memory: 128Gi
+            cpu: "64"
+            nvidia.com/gpu: "4"
+      volumes:
+      - name: part-vol-3
+        persistentVolumeClaim:
+          claimName: part-vol-3
+      restartPolicy: Never
+  backoffLimit: 0

@@ -1,0 +1,19 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+
+cloudpickle
+dm_haiku>=0.0.10
+e3nn_jax==0.20.3
+h5py
+jax-sph>=0.0.3
+jax[cuda12]==0.4.29
+jmp>=0.0.4
+jraph>=0.0.6.dev0
+matscipy>=0.8.0
+omegaconf>=2.3.0
+optax>=0.1.7
+ott-jax>=0.4.2
+pyvista
+PyYAML
+torch==2.3.1+cpu
+wandb
+wget

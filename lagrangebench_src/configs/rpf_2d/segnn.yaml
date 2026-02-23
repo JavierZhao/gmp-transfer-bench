@@ -1,0 +1,11 @@
+extends: configs/rpf_2d/base.yaml
+
+model: 
+  name: segnn
+  num_mp_steps: 10
+  latent_dim: 64
+  isotropic_norm: True
+
+train:
+  optimizer:
+    lr_start: 1.e-3

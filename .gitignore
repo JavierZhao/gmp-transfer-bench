@@ -1,0 +1,40 @@
+# macOS / OS files
+.DS_Store
+**/.DS_Store
+Thumbs.db
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+
+# Python tooling caches
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Packaging/build outputs
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Logs
+*.log
+
+# Editors / IDE
+.vscode/
+.idea/
+
+# Local env files
+.env
+.env.*
