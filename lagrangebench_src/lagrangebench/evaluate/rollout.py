@@ -22,7 +22,10 @@ from lagrangebench.evaluate.utils import write_vtk
 from lagrangebench.utils import (
     broadcast_from_batch,
     broadcast_to_batch,
+    format_count,
+    get_forward_flops,
     get_kinematic_mask,
+    get_num_params,
     load_haiku,
     set_seed,
 )
@@ -380,7 +383,14 @@ def infer(
     # init values
     pos_input_and_target, particle_type = next(iter(loader_test))
     sample = (pos_input_and_target[0], particle_type[0])
-    key, _, _, neighbors = case.allocate(key, sample)
+    key, features, _, neighbors = case.allocate(key, sample)
+
+    num_params = int(get_num_params(params))
+    forward_flops = get_forward_flops(
+        model_apply, params, state, (features, particle_type[0])
+    )
+    print(f"Model parameters: {format_count(num_params)}")
+    print(f"Model forward FLOPs: {format_count(forward_flops)}")
 
     eval_metrics = eval_rollout(
         model_apply=model_apply,

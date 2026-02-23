@@ -133,6 +133,52 @@ def get_num_params(params):
     return sum(np.prod(p.shape) for p in jax.tree_leaves(params))
 
 
+def get_forward_flops(model_apply_jit, params, state, sample):
+    """Estimate FLOPs for one forward pass via JAX/XLA cost analysis.
+
+    Returns:
+        int FLOPs if available, otherwise None.
+    """
+    try:
+        lowered = model_apply_jit.lower(params, state, sample)
+        cost = lowered.cost_analysis()
+    except Exception:
+        return None
+
+    if isinstance(cost, dict):
+        flops = cost.get("flops", cost.get("flop_count"))
+        return int(flops) if flops is not None else None
+
+    if isinstance(cost, (list, tuple)):
+        total = 0.0
+        found = False
+        for item in cost:
+            if isinstance(item, dict):
+                val = item.get("flops", item.get("flop_count"))
+                if val is not None:
+                    total += float(val)
+                    found = True
+        if found:
+            return int(total)
+
+    return None
+
+
+def format_count(n: int) -> str:
+    """Format a count with both grouped digits and SI-like suffix."""
+    if n is None:
+        return "N/A"
+
+    suffixes = ["", "K", "M", "B", "T", "P"]
+    value = float(n)
+    idx = 0
+    while abs(value) >= 1000.0 and idx < len(suffixes) - 1:
+        value /= 1000.0
+        idx += 1
+
+    return f"{n:,} ({value:.2f}{suffixes[idx]})"
+
+
 def print_params_shapes(params, prefix=""):
     if not isinstance(params, dict):
         print(f"{prefix: <40}, shape = {params.shape}")

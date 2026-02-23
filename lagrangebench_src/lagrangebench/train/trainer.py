@@ -22,6 +22,8 @@ from lagrangebench.evaluate import MetricsComputer, averaged_metrics, eval_rollo
 from lagrangebench.utils import (
     broadcast_from_batch,
     broadcast_to_batch,
+    format_count,
+    get_forward_flops,
     get_kinematic_mask,
     get_num_params,
     load_haiku,
@@ -272,6 +274,13 @@ class Trainer:
             key, subkey = jax.random.split(key, 2)
             params, state = model.init(subkey, (features, particle_type[0]))
 
+        num_params = int(get_num_params(params))
+        forward_flops = get_forward_flops(
+            model_apply, params, state, (features, particle_type[0])
+        )
+        print(f"Model parameters: {format_count(num_params)}")
+        print(f"Model forward FLOPs: {format_count(forward_flops)}")
+
         # start logging
         if cfg_logging.wandb:
             if wandb_config is None:
@@ -290,7 +299,8 @@ class Trainer:
                 "dataset_name": loader_train.dataset.name,
                 "len_train": len(loader_train.dataset),
                 "len_eval": len(loader_valid.dataset),
-                "num_params": get_num_params(params).item(),
+                "num_params": num_params,
+                "forward_flops": forward_flops,
                 "step_start": step,
             }
 
