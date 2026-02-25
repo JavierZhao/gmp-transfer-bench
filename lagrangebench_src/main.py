@@ -3,6 +3,31 @@ import os
 from omegaconf import DictConfig, OmegaConf
 
 
+def ensure_requested_gpu_available(gpu_id: int) -> None:
+    """Fail fast when a GPU run is requested but JAX only sees CPU devices."""
+    if gpu_id == -1:
+        return
+
+    import jax
+
+    devices = jax.devices()
+    gpu_devices = [device for device in devices if device.platform == "gpu"]
+    if gpu_devices:
+        print(f"JAX GPU devices detected: {gpu_devices}")
+        return
+
+    jax_platforms = os.environ.get("JAX_PLATFORMS", "<unset>")
+    raise RuntimeError(
+        "A GPU run was requested (gpu={gpu_id}), but JAX reported no GPU devices. "
+        "Detected JAX devices: {devices}. "
+        "JAX_PLATFORMS={jax_platforms}. "
+        "This usually means the environment has CPU-only JAX wheels. "
+        "Install GPU-enabled JAX (for example: `pip install -U \"jax[cuda12]==0.4.29\"`) "
+        "and ensure the CUDA plugin packages are installed."
+        .format(gpu_id=gpu_id, devices=devices, jax_platforms=jax_platforms)
+    )
+
+
 def check_subset(superset, subset, full_key=""):
     """Check that the keys of 'subset' are a subset of 'superset'."""
     for k, v in subset.items():
@@ -62,6 +87,8 @@ if __name__ == "__main__":
     if cli_args.gpu == -1:
         os.environ["JAX_PLATFORMS"] = "cpu"
     os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = str(cli_args.xla_mem_fraction)
+
+    ensure_requested_gpu_available(cli_args.gpu)
 
     # The following line makes the code deterministic on GPUs, but also extremely slow.
     # os.environ["XLA_FLAGS"] = "--xla_gpu_deterministic_ops=true"
