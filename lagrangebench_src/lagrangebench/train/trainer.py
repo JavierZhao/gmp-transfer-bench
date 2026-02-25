@@ -10,7 +10,6 @@ import jax
 import jax.numpy as jnp
 import jraph
 import optax
-import wandb
 from jax import vmap
 from omegaconf import DictConfig, OmegaConf
 from torch.utils.data import DataLoader
@@ -283,6 +282,8 @@ class Trainer:
 
         # start logging
         if cfg_logging.wandb:
+            import wandb
+
             if wandb_config is None:
                 # minimal config reconstruction without model details
                 wandb_config = {
