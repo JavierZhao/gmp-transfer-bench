@@ -92,7 +92,8 @@ class MetricsComputer:
                     )
                     # shorter horizon losses
                     for i in self._loss_ranges:
-                        if i < metrics[metric_name].shape[0]:
+                        # Include horizons equal to rollout length (e.g. mse20 for 20-step eval).
+                        if i <= metrics[metric_name].shape[0]:
                             metrics[f"{metric_name}{i}"] = metrics[metric_name][:i]
 
                 elif metric_name in ["e_kin"]:

@@ -138,7 +138,24 @@ def train_or_infer(cfg: Union[Dict, DictConfig]):
 
         split = "test" if is_test else "valid"
         print(f"Metrics of {model_dir} on {split} split:")
-        print(averaged_metrics(metrics))
+
+        avg_metrics = averaged_metrics(metrics)
+        rollout_horizon = cfg.eval.n_rollout_steps
+        if rollout_horizon > 0:
+            mse_key = f"val/mse{rollout_horizon}"
+        else:
+            mse_key = "val/loss"
+
+        comparable_metrics = {}
+        mse_value = avg_metrics.get(mse_key, avg_metrics.get("val/loss"))
+        if mse_value is not None:
+            comparable_metrics[mse_key] = mse_value
+        if "val/sinkhorn" in avg_metrics:
+            comparable_metrics["val/sinkhorn"] = avg_metrics["val/sinkhorn"]
+        if "val/e_kin" in avg_metrics:
+            comparable_metrics["val/e_kin"] = avg_metrics["val/e_kin"]
+
+        print(comparable_metrics)
 
     return 0
 
