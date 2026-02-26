@@ -26,8 +26,6 @@ spec:
               - key: nvidia.com/gpu.product
                 operator: In
                 values:
-                - NVIDIA-GeForce-GTX-1080-Ti
-                - NVIDIA-GeForce-GTX-2080-Ti
                 - NVIDIA-GeForce-RTX-3090
                 - NVIDIA-GeForce-RTX-4090
       containers:
@@ -58,6 +56,9 @@ spec:
 
           echo "[preflight] Verifying JAX GPU backend"
           "${PY}" -c 'import jax; devs=jax.devices(); print("jax devices:", devs); assert any(d.platform == "gpu" for d in devs), f"GPU requested but JAX devices are {devs}"'
+
+          # Work around cuDNN algorithm picker failures for grouped/depthwise conv on some GPUs.
+          export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false --xla_gpu_autotune_level=0"
 
           "${PY}" -u main.py \
             config=configs/tgv_2d/segnn_gmp.yaml \
