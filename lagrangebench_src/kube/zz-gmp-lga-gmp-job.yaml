@@ -1,7 +1,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: zz-gmp-lga-gmp
+  name: zz-gmp-lga-baseline-then-gmp-sweep-gpu
   namespace: cms-ml
   labels:
     jobgroup: pulse-pretrain
@@ -41,7 +41,6 @@ spec:
 
           ENV_PREFIX=/j-jepa-vol/conda_envs/lgbench310
           PY="${ENV_PREFIX}/bin/python"
-          PIP="${ENV_PREFIX}/bin/pip"
           REPO=/j-jepa-vol/gmp-transfer-bench/lagrangebench_src
           RUN_TAG=$(date +%Y%m%d-%H%M%S)
 
@@ -51,25 +50,89 @@ spec:
           echo "[preflight] NVIDIA visibility"
           nvidia-smi -L
 
-          echo "[preflight] Installing GPU-enabled JAX runtime"
-          "${PIP}" install -U --no-cache-dir "jax[cuda12]==0.4.29"
+          echo "[preflight] Installing project runtime dependencies"
+          "${PY}" -m pip install -U --no-cache-dir -r requirements_cuda.txt
 
-          echo "[preflight] Verifying JAX GPU backend"
-          "${PY}" -c 'import jax; devs=jax.devices(); print("jax devices:", devs); assert any(d.platform == "gpu" for d in devs), f"GPU requested but JAX devices are {devs}"'
+          echo "[preflight] Verifying imports + JAX GPU backend"
+          "${PY}" -c 'import omegaconf, jax; print("omegaconf:", omegaconf.__version__); devs=jax.devices(); print("jax devices:", devs); assert any(d.platform == "gpu" for d in devs), f"GPU requested but JAX devices are {devs}"'
 
           # Work around cuDNN algorithm picker failures for grouped/depthwise conv on some GPUs.
           export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false --xla_gpu_autotune_level=0"
 
-          "${PY}" -u main.py \
-            config=configs/tgv_2d/segnn_gmp.yaml \
-            mode=train gpu=0 dtype=float32 \
-            train.num_workers=0 train.step_max=20000 \
-            logging.eval_steps=5000 \
-            eval.train.n_trajs=10 \
-            logging.wandb=false \
-            logging.run_name=segnn_tgv2d_gmp_train_${RUN_TAG} \
-            logging.ckp_dir=/j-jepa-vol/gmp_transfer/ckp \
-            2>&1 | tee /j-jepa-vol/gmp_transfer/logs/segnn_gmp_train_${RUN_TAG}.log
+          echo "[preflight] job revision: baseline-then-gmp-sweep-v2"
+
+          # Fair protocol knobs (override here as needed).
+          CKP_DIR=/j-jepa-vol/gmp_transfer/ckp
+          LOG_DIR=/j-jepa-vol/gmp_transfer/logs
+          BASE_CONFIG=configs/tgv_2d/segnn.yaml
+          GMP_CONFIG=configs/tgv_2d/segnn_gmp.yaml
+
+          # For closest published-comparison runs, increase STEP_MAX to 500000.
+          STEP_MAX=300000
+          EVAL_STEPS=10000
+          TRAIN_EVAL_TRAJS=50
+          SEEDS="0"
+          GPU_ID=0
+          DTYPE=float32
+          NUM_WORKERS=0
+
+          GMP_KERNEL=3
+          GMP_GRID_BINS_LIST="32 64 96"
+          GMP_REDUCE_LIST="sum mean"
+
+          mkdir -p "${CKP_DIR}" "${LOG_DIR}"
+
+          # Validate runtime with the exact interpreter used for training.
+          if ! "${PY}" -c 'import importlib.util, sys; mods=["omegaconf","jax","haiku","e3nn_jax","jraph","optax","torch"]; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print("runtime missing:", missing); sys.exit(1 if missing else 0)'; then
+            echo "[preflight] Missing deps after initial install, retrying with python -m pip"
+            "${PY}" -m pip install -U --no-cache-dir -r requirements_cuda.txt
+            "${PY}" -c 'import importlib.util, sys; mods=["omegaconf","jax","haiku","e3nn_jax","jraph","optax","torch"]; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print("runtime missing:", missing); sys.exit(1 if missing else 0)'
+          fi
+
+          run_one() {
+            local run_name="$1"
+            shift
+
+            echo "[run] ${run_name}"
+            "${PY}" -u main.py \
+              mode=all \
+              gpu="${GPU_ID}" \
+              dtype="${DTYPE}" \
+              train.num_workers="${NUM_WORKERS}" \
+              train.step_max="${STEP_MAX}" \
+              logging.eval_steps="${EVAL_STEPS}" \
+              eval.train.n_trajs="${TRAIN_EVAL_TRAJS}" \
+              eval.test=true \
+              logging.wandb=false \
+              logging.ckp_dir="${CKP_DIR}" \
+              logging.run_name="${run_name}" \
+              "$@" \
+              2>&1 | tee "${LOG_DIR}/${run_name}.log"
+          }
+
+          echo "[phase 1/2] SEGNN baseline first"
+          for seed in ${SEEDS}; do
+            run_one \
+              "segnn_baseline_seed${seed}_${RUN_TAG}" \
+              config="${BASE_CONFIG}" \
+              seed="${seed}"
+          done
+
+          echo "[phase 2/2] SEGNN+GMP sweep"
+          for reduce in ${GMP_REDUCE_LIST}; do
+            for bins in ${GMP_GRID_BINS_LIST}; do
+              for seed in ${SEEDS}; do
+                run_one \
+                  "segnn_gmp_k${GMP_KERNEL}_b${bins}_${reduce}_seed${seed}_${RUN_TAG}" \
+                  config="${GMP_CONFIG}" \
+                  seed="${seed}" \
+                  model.use_gmp=true \
+                  model.gmp_kernel="${GMP_KERNEL}" \
+                  model.gmp_grid_bins="${bins}" \
+                  model.gmp_reduce="${reduce}"
+              done
+            done
+          done
         resources:
           requests:
             cpu: "4"
