@@ -54,12 +54,12 @@ spec:
           "${PY}" -m pip install -U --no-cache-dir -r requirements_cuda.txt
 
           echo "[preflight] Verifying imports + JAX GPU backend"
-          "${PY}" -c 'import omegaconf, jax; print("omegaconf:", omegaconf.__version__); devs=jax.devices(); print("jax devices:", devs); assert any(d.platform == "gpu" for d in devs), f"GPU requested but JAX devices are {devs}"'
+          "${PY}" -c 'import omegaconf, jax, ott; from ott.geometry.geometry import Geometry; print("omegaconf:", omegaconf.__version__); print("jax:", jax.__version__); print("ott:", ott.__version__); devs=jax.devices(); print("jax devices:", devs); assert any(d.platform == "gpu" for d in devs), f"GPU requested but JAX devices are {devs}"'
 
           # Work around cuDNN algorithm picker failures for grouped/depthwise conv on some GPUs.
           export XLA_FLAGS="${XLA_FLAGS:-} --xla_gpu_strict_conv_algorithm_picker=false --xla_gpu_autotune_level=0"
 
-          echo "[preflight] job revision: baseline-then-gmp-sweep-v2"
+          echo "[preflight] job revision: baseline-then-gmp-sweep-v3"
 
           # Fair protocol knobs (override here as needed).
           CKP_DIR=/j-jepa-vol/gmp_transfer/ckp
@@ -83,10 +83,10 @@ spec:
           mkdir -p "${CKP_DIR}" "${LOG_DIR}"
 
           # Validate runtime with the exact interpreter used for training.
-          if ! "${PY}" -c 'import importlib.util, sys; mods=["omegaconf","jax","haiku","e3nn_jax","jraph","optax","torch"]; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print("runtime missing:", missing); sys.exit(1 if missing else 0)'; then
+          if ! "${PY}" -c 'import omegaconf, jax, haiku, e3nn_jax, jraph, optax, torch, ott; from ott.geometry.geometry import Geometry; print("omegaconf:", omegaconf.__version__); print("jax:", jax.__version__); print("ott:", ott.__version__);'; then
             echo "[preflight] Missing deps after initial install, retrying with python -m pip"
             "${PY}" -m pip install -U --no-cache-dir -r requirements_cuda.txt
-            "${PY}" -c 'import importlib.util, sys; mods=["omegaconf","jax","haiku","e3nn_jax","jraph","optax","torch"]; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print("runtime missing:", missing); sys.exit(1 if missing else 0)'
+            "${PY}" -c 'import omegaconf, jax, haiku, e3nn_jax, jraph, optax, torch, ott; from ott.geometry.geometry import Geometry; print("omegaconf:", omegaconf.__version__); print("jax:", jax.__version__); print("ott:", ott.__version__);'
           fi
 
           run_one() {

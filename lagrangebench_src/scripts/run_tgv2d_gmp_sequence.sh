@@ -31,7 +31,7 @@ EXTRA_ARGS=("$@")
 
 ensure_runtime() {
   local smoke_check
-  smoke_check='import importlib.util, sys; mods=["omegaconf","jax","haiku","e3nn_jax","jraph","optax","torch"]; missing=[m for m in mods if importlib.util.find_spec(m) is None]; print("runtime missing:", missing); sys.exit(1 if missing else 0)'
+  smoke_check='import omegaconf, jax, haiku, e3nn_jax, jraph, optax, torch, ott; from ott.geometry.geometry import Geometry; print("omegaconf:", omegaconf.__version__); print("jax:", jax.__version__); print("ott:", ott.__version__); print("jax devices:", jax.devices())'
 
   echo "[preflight] python executable: ${PYTHON_BIN}"
   "${PYTHON_BIN}" -V
