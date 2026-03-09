@@ -13,12 +13,23 @@ NUM_EPOCHS="${NUM_EPOCHS:-5}"
 BATCH_SIZE="${BATCH_SIZE:-512}"
 FEATURE_TYPE="${FEATURE_TYPE:-full}"
 COMMENT_BASE="${COMMENT_BASE:-_quick_ablation}"
+NUM_WORKERS="${NUM_WORKERS:-1}"
+
+if [[ ! "$NUM_WORKERS" =~ ^[0-9]+$ ]]; then
+  echo "NUM_WORKERS must be a non-negative integer, got: ${NUM_WORKERS}" >&2
+  exit 1
+fi
+if (( NUM_WORKERS < 1 )); then
+  echo "NUM_WORKERS=${NUM_WORKERS} is incompatible with weaver persistent_workers; clamping to 1" >&2
+  NUM_WORKERS=1
+fi
 
 COMMON_ARGS=(
   --samples-per-epoch "$SAMPLES_PER_EPOCH"
   --samples-per-epoch-val "$SAMPLES_PER_EPOCH_VAL"
   --num-epochs "$NUM_EPOCHS"
   --batch-size "$BATCH_SIZE"
+  --num-workers "$NUM_WORKERS"
 )
 
 echo "[1/2] Running ParT baseline"

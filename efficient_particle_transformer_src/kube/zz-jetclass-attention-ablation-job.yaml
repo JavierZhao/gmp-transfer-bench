@@ -1,0 +1,129 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zz-jetclass-attention-ablation-gpu
+  namespace: cms-ml
+  labels:
+    jobgroup: gmp-transfer
+spec:
+  backoffLimit: 0
+  parallelism: 1
+  ttlSecondsAfterFinished: 86400
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/hostname
+                    operator: NotIn
+                    values:
+                      - gpn-fiona-mizzou-2.rnet.missouri.edu
+                      - rci-nrp-gpu-05.sdsu.edu
+                      - node-2-2.sdsc.optiputer.net
+                  - key: nvidia.com/gpu.product
+                    operator: In
+                    values:
+                      - NVIDIA-GeForce-RTX-3090
+                      - NVIDIA-GeForce-RTX-4090
+      containers:
+        - name: training
+          image: gitlab-registry.nrp-nautilus.io/jmduarte/weaver:latest
+          imagePullPolicy: Always
+          command:
+            - /bin/bash
+            - -lc
+          args:
+            - |
+              set -euo pipefail
+
+              PY=python3
+              REPO=/j-jepa-vol/gmp-transfer-bench/efficient_particle_transformer_src
+              GIT_REF="${GIT_REF:-codex/jetclass-attn-ablation}"
+              RUN_TAG="$(date +%Y%m%d-%H%M%S)"
+              LOG_DIR=/j-jepa-vol/gmp_transfer/jetclass_attention_ablation/logs
+              JETCLASS_DIR="${JETCLASS_DIR:-/ParTGMP/JetClass}"
+
+              export SAMPLES_PER_EPOCH="${SAMPLES_PER_EPOCH:-32768}"
+              export SAMPLES_PER_EPOCH_VAL="${SAMPLES_PER_EPOCH_VAL:-8192}"
+              export NUM_EPOCHS="${NUM_EPOCHS:-5}"
+              export BATCH_SIZE="${BATCH_SIZE:-512}"
+              export FEATURE_TYPE="${FEATURE_TYPE:-full}"
+              export COMMENT_BASE="${COMMENT_BASE:-_nautilus_attn_ablation_${RUN_TAG}}"
+              export NUM_WORKERS="${NUM_WORKERS:-1}"
+              if ! [[ "${NUM_WORKERS}" =~ ^[0-9]+$ ]]; then
+                echo "NUM_WORKERS must be a non-negative integer, got: ${NUM_WORKERS}" >&2
+                exit 1
+              fi
+              if (( NUM_WORKERS < 1 )); then
+                echo "[preflight] NUM_WORKERS=${NUM_WORKERS} is incompatible with weaver persistent_workers; clamping to 1"
+                export NUM_WORKERS=1
+              fi
+
+              mkdir -p "${LOG_DIR}"
+              cd "${REPO}"
+
+              echo "[preflight] updating repo to ${GIT_REF}"
+              git fetch origin --prune
+              if git show-ref --verify --quiet "refs/heads/${GIT_REF}"; then
+                git checkout "${GIT_REF}"
+              else
+                git checkout -B "${GIT_REF}" "origin/${GIT_REF}"
+              fi
+              git pull --ff-only origin "${GIT_REF}"
+
+              echo "[preflight] NVIDIA visibility"
+              nvidia-smi -L
+
+              echo "[preflight] ensuring weaver runtime"
+              "${PY}" -m pip install -U --no-cache-dir 'weaver-core>=0.4'
+
+              echo "[preflight] verifying torch + weaver"
+              "${PY}" - <<'PY'
+              import shutil
+              import torch
+
+              print("torch:", torch.__version__)
+              print("cuda available:", torch.cuda.is_available())
+              if torch.cuda.is_available():
+                  print("cuda device count:", torch.cuda.device_count())
+              weaver = shutil.which("weaver")
+              print("weaver:", weaver)
+              assert weaver, "weaver command not found after dependency install"
+              PY
+
+              cp env.sh env.sh.jobbak
+              cleanup() {
+                mv env.sh.jobbak env.sh
+              }
+              trap cleanup EXIT
+              sed -i "s#^export DATADIR_JetClass=.*#export DATADIR_JetClass=${JETCLASS_DIR}#" env.sh
+
+              echo "[run] quick JetClass attention ablation"
+              ./scripts/run_quick_hep_attention_ablation.sh \
+                --gpus 0 \
+                2>&1 | tee "${LOG_DIR}/jetclass_attention_ablation_${RUN_TAG}.log"
+          resources:
+            requests:
+              cpu: "4"
+              memory: 22Gi
+              nvidia.com/gpu: "1"
+            limits:
+              cpu: "4"
+              memory: 26Gi
+              nvidia.com/gpu: "1"
+          volumeMounts:
+            - name: j-jepa-vol
+              mountPath: /j-jepa-vol
+            - name: dshm
+              mountPath: /dev/shm
+      volumes:
+        - name: j-jepa-vol
+          persistentVolumeClaim:
+            claimName: j-jepa-vol
+        - name: dshm
+          emptyDir:
+            medium: Memory
+            sizeLimit: 8Gi
