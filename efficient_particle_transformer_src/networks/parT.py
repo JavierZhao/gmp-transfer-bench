@@ -8,6 +8,7 @@ import warnings
 import copy
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from functools import partial
 
 from networks.logger import _logger
@@ -260,6 +261,125 @@ class Embed(nn.Module):
         return self.embed(x)
 
 
+def quantize_coordinates(c1: torch.Tensor, c2: torch.Tensor, grid_size: float, pad: torch.Tensor | None = None):
+    if pad is None:
+        valid = torch.ones_like(c1, dtype=torch.bool)
+    else:
+        valid = ~pad
+
+    c1_for_min = c1.masked_fill(~valid, float("inf"))
+    c2_for_min = c2.masked_fill(~valid, float("inf"))
+    c1_min = c1_for_min.min(dim=1, keepdim=True).values
+    c2_min = c2_for_min.min(dim=1, keepdim=True).values
+    c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
+    c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
+
+    c1_shift = (c1 - c1_min).masked_fill(~valid, 0.0)
+    c2_shift = (c2 - c2_min).masked_fill(~valid, 0.0)
+    coord_eta = c1_shift / grid_size
+    coord_phi = c2_shift / grid_size
+
+    grid_eta = coord_eta.floor().to(torch.long)
+    grid_phi = coord_phi.floor().to(torch.long)
+    grid_eta = grid_eta.masked_fill(~valid, 0)
+    grid_phi = grid_phi.masked_fill(~valid, 0)
+
+    if valid.any().item():
+        H = int(grid_eta.max().item()) + 1
+        W = int(grid_phi.max().item()) + 1
+    else:
+        H, W = 1, 1
+
+    H = max(H, 1)
+    W = max(W, 1)
+    grid_eta = grid_eta.clamp(0, H - 1)
+    grid_phi = grid_phi.clamp(0, W - 1)
+
+    B, P = c1.shape
+    batch_idx = torch.arange(B, device=c1.device).view(B, 1).expand(B, P)
+    flat_local = grid_eta * W + grid_phi
+    return {
+        "valid": valid,
+        "grid_eta": grid_eta,
+        "grid_phi": grid_phi,
+        "coord_eta": coord_eta,
+        "coord_phi": coord_phi,
+        "batch_idx": batch_idx,
+        "flat_local": flat_local,
+        "height": H,
+        "width": W,
+    }
+
+
+def scatter_to_grid(
+        x: torch.Tensor,
+        quantized: dict,
+        scatter_reduce: str = "sum",
+        eps: float = 1e-6):
+    B, _, C = x.shape
+    H = quantized["height"]
+    W = quantized["width"]
+    HW = H * W
+    flat_idx = (quantized["batch_idx"] * HW + quantized["flat_local"]).reshape(-1)
+    valid = quantized["valid"].reshape(-1).to(x.dtype)
+
+    grid_flat = x.new_zeros((B * HW, C))
+    values = (x * quantized["valid"].unsqueeze(-1).to(x.dtype)).reshape(-1, C)
+    grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), values)
+
+    counts = x.new_zeros((B * HW,))
+    counts.scatter_add_(0, flat_idx, valid)
+    if scatter_reduce == "mean":
+        grid_flat = grid_flat / (counts[:, None] + eps)
+
+    grid = grid_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
+    return grid, counts.view(B, HW)
+
+
+def gather_from_grid(grid: torch.Tensor, quantized: dict) -> torch.Tensor:
+    grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
+    gathered = grid_bhwc[quantized["batch_idx"], quantized["grid_eta"], quantized["grid_phi"]]
+    return gathered * quantized["valid"].unsqueeze(-1).to(gathered.dtype)
+
+
+def grid_sample_coordinates(quantized: dict) -> torch.Tensor:
+    H = quantized["height"]
+    W = quantized["width"]
+    coord_eta = quantized["coord_eta"]
+    coord_phi = quantized["coord_phi"]
+
+    if W > 1:
+        norm_x = 2.0 * coord_phi / (W - 1) - 1.0
+    else:
+        norm_x = torch.zeros_like(coord_phi)
+    if H > 1:
+        norm_y = 2.0 * coord_eta / (H - 1) - 1.0
+    else:
+        norm_y = torch.zeros_like(coord_eta)
+
+    coords = torch.stack((norm_x, norm_y), dim=-1)
+    return coords.masked_fill(~quantized["valid"].unsqueeze(-1), 0.0)
+
+
+def select_active_grid_tokens(grid: torch.Tensor, counts: torch.Tensor):
+    B, C, H, W = grid.shape
+    HW = H * W
+    occupied = counts > 0
+    num_tokens = occupied.sum(dim=1)
+    max_tokens = int(num_tokens.max().item()) if num_tokens.numel() > 0 else 0
+    if max_tokens == 0:
+        return None, None
+
+    dense_tokens = grid.permute(0, 2, 3, 1).reshape(B, HW, C)
+    flat_positions = torch.arange(HW, device=grid.device, dtype=torch.long).unsqueeze(0).expand(B, -1)
+    sort_keys = torch.where(occupied, flat_positions, flat_positions + HW)
+    top_idx = sort_keys.argsort(dim=1)[:, :max_tokens]
+    token_mask = torch.arange(max_tokens, device=grid.device).unsqueeze(0) < num_tokens.unsqueeze(1)
+    tokens = dense_tokens.gather(1, top_idx.unsqueeze(-1).expand(-1, -1, C))
+    tokens = tokens.masked_fill(~token_mask.unsqueeze(-1), 0.0)
+    return tokens, token_mask
+
+
 class PairEmbed(nn.Module):
     def __init__(
             self, pairwise_lv_dim, pairwise_input_dim, dims,
@@ -460,6 +580,49 @@ class Block(nn.Module):
         x += residual
 
         return x
+
+
+class CrossAttentionBlock(nn.Module):
+    def __init__(self, embed_dim=128, num_heads=8, ffn_ratio=2,
+                 dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
+                 activation='gelu'):
+        super().__init__()
+
+        self.embed_dim = embed_dim
+        self.ffn_dim = embed_dim * ffn_ratio
+        self.query_norm = nn.LayerNorm(embed_dim)
+        self.context_norm = nn.LayerNorm(embed_dim)
+        self.attn = nn.MultiheadAttention(embed_dim, num_heads, dropout=attn_dropout)
+        self.dropout = nn.Dropout(dropout)
+
+        self.pre_fc_norm = nn.LayerNorm(embed_dim)
+        self.fc1 = nn.Linear(embed_dim, self.ffn_dim)
+        self.act = nn.GELU() if activation == 'gelu' else nn.ReLU()
+        self.act_dropout = nn.Dropout(activation_dropout)
+        self.post_fc_norm = nn.LayerNorm(self.ffn_dim)
+        self.fc2 = nn.Linear(self.ffn_dim, embed_dim)
+
+    def forward(self, query, context, query_padding_mask=None, context_padding_mask=None):
+        residual = query
+        q = self.query_norm(query)
+        kv = self.context_norm(context)
+        query = self.attn(q, kv, kv, key_padding_mask=context_padding_mask)[0]
+        if query_padding_mask is not None:
+            query = query.masked_fill(query_padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
+        query = residual + self.dropout(query)
+
+        residual = query
+        query = self.pre_fc_norm(query)
+        query = self.act(self.fc1(query))
+        query = self.act_dropout(query)
+        query = self.post_fc_norm(query)
+        query = self.fc2(query)
+        query = residual + self.dropout(query)
+        if query_padding_mask is not None:
+            query = query.masked_fill(query_padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
+        return query
+
+
 class GeometricMessagePassing(nn.Module):
     def __init__(
         self,
@@ -487,63 +650,191 @@ class GeometricMessagePassing(nn.Module):
         self.pointwise = nn.Linear(channels, channels, bias=True)
         self.norm = nn.LayerNorm(channels, eps=1e-6)
 
-    def forward(self, x: torch.Tensor,  c1: torch.Tensor, c2: torch.Tensor, pad: torch.Tensor | None = None) -> torch.Tensor:
-        B, P, C = x.shape
+    def encode_grid(self, x: torch.Tensor, c1: torch.Tensor, c2: torch.Tensor, pad: torch.Tensor | None = None):
+        quantized = quantize_coordinates(c1, c2, self.grid_size, pad=pad)
+        grid, counts = scatter_to_grid(
+            x,
+            quantized,
+            scatter_reduce=self.scatter_reduce,
+            eps=self.eps,
+        )
+        grid = self.conv2d(grid)
+        gathered = gather_from_grid(grid, quantized)
+        return {
+            "grid": grid,
+            "counts": counts,
+            "quantized": quantized,
+            "gathered": gathered,
+            "sample_coords": grid_sample_coordinates(quantized),
+        }
+
+    def forward(self,
+                x: torch.Tensor,
+                c1: torch.Tensor,
+                c2: torch.Tensor,
+                pad: torch.Tensor | None = None,
+                return_context: bool = False):
+        B, _, C = x.shape
         assert C == self.channels
         residual = x
 
-        if pad is not None:
-            c1_for_min = c1.masked_fill(pad, float("inf"))
-            c2_for_min = c2.masked_fill(pad, float("inf"))
-            c1_min = c1_for_min.min(dim=1, keepdim=True).values
-            c2_min = c2_for_min.min(dim=1, keepdim=True).values
-
-            c1_min = torch.where(torch.isfinite(c1_min), c1_min, torch.zeros_like(c1_min))
-            c2_min = torch.where(torch.isfinite(c2_min), c2_min, torch.zeros_like(c2_min))
-
-            c1_shift = (c1 - c1_min).masked_fill(pad, 0.0)
-            c2_shift = (c2 - c2_min).masked_fill(pad, 0.0)
-        else:
-            c1_shift = c1 - c1.min(dim=1, keepdim=True).values
-            c2_shift = c2 - c2.min(dim=1, keepdim=True).values
-
-        grid_eta = (c1_shift / self.grid_size).floor().to(torch.long) # [B,P]
-        grid_phi = (c2_shift / self.grid_size).floor().to(torch.long) # [B,P]
-
-        H = int(grid_eta.max().item()) + 1
-        W = int(grid_phi.max().item()) + 1
-
-        H = max(H, 1)
-        W = max(W, 1)
-
-        grid_eta = grid_eta.clamp(0, H - 1)
-        grid_phi = grid_phi.clamp(0, W - 1)
-
-        HW = H * W
-        b_idx = torch.arange(B, device=x.device).view(B, 1).expand(B, P)  # [B,P]
-        flat_idx = (b_idx * HW + grid_eta * W + grid_phi).reshape(-1)      # [B*P]
-
-        # Scatter into grid_flat: [B*H*W, C]
-        grid_flat = x.new_zeros((B * HW, C))
-        grid_flat.scatter_add_(0, flat_idx[:, None].expand(-1, C), x.reshape(-1, C))
-
-        if self.scatter_reduce == "mean":
-            ones = x.new_ones((B * P,))
-            counts = x.new_zeros((B * HW,))
-            counts.scatter_add_(0, flat_idx, ones)
-            grid_flat = grid_flat / (counts[:, None] + self.eps)
-
-        # Conv: [B,C,H,W]
-        grid = grid_flat.view(B, H, W, C).permute(0, 3, 1, 2).contiguous()
-        grid = self.conv2d(grid)
-
-        # Gather back: [B,P,C]
-        grid_bhwc = grid.permute(0, 2, 3, 1).contiguous()
-        out = grid_bhwc[b_idx, grid_eta, grid_phi]
-
-        out = self.pointwise(out)
+        context = self.encode_grid(x, c1, c2, pad=pad)
+        out = self.pointwise(context["gathered"])
         out = self.norm(out)
-        return residual + out
+        out = residual + out
+        if return_context:
+            return out, context
+        return out
+
+
+class GridParticleCrossAttention(nn.Module):
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=8,
+                 num_layers=1,
+                 dropout=0.1,
+                 attn_dropout=0.1,
+                 activation_dropout=0.1,
+                 activation='gelu'):
+        super().__init__()
+        self.grid_blocks = nn.ModuleList([
+            Block(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                ffn_ratio=2,
+                dropout=dropout,
+                attn_dropout=attn_dropout,
+                activation_dropout=activation_dropout,
+                activation=activation,
+            )
+            for _ in range(num_layers)
+        ])
+        self.cross_block = CrossAttentionBlock(
+            embed_dim=embed_dim,
+            num_heads=num_heads,
+            ffn_ratio=2,
+            dropout=dropout,
+            attn_dropout=attn_dropout,
+            activation_dropout=activation_dropout,
+            activation=activation,
+        )
+
+    def forward(self, x: torch.Tensor, grid_context: dict, pad: torch.Tensor | None = None) -> torch.Tensor:
+        tokens, token_mask = select_active_grid_tokens(grid_context["grid"], grid_context["counts"])
+        if tokens is None:
+            return x
+
+        grid_tokens = tokens.permute(1, 0, 2).contiguous()
+        grid_padding_mask = ~token_mask
+        for block in self.grid_blocks:
+            grid_tokens = block(grid_tokens, padding_mask=grid_padding_mask)
+
+        particle_tokens = x.permute(1, 0, 2).contiguous()
+        particle_tokens = self.cross_block(
+            particle_tokens,
+            grid_tokens,
+            query_padding_mask=pad,
+            context_padding_mask=grid_padding_mask,
+        )
+        x = particle_tokens.permute(1, 0, 2).contiguous()
+        if pad is not None:
+            x = x.masked_fill(pad.unsqueeze(-1), 0.0)
+        return x
+
+
+class SubstructureAwareDeformableAttention(nn.Module):
+    def __init__(self,
+                 embed_dim=128,
+                 num_heads=8,
+                 num_samples=8,
+                 offset_scale=2.0,
+                 dropout=0.1,
+                 activation_dropout=0.1,
+                 activation='gelu'):
+        super().__init__()
+        if embed_dim % num_heads != 0:
+            raise ValueError(f"embed_dim={embed_dim} must be divisible by num_heads={num_heads}.")
+        if num_samples <= 0:
+            raise ValueError(f"num_samples must be positive, got {num_samples}.")
+
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.num_samples = num_samples
+        self.offset_scale = float(offset_scale)
+
+        self.pre_attn_norm = nn.LayerNorm(embed_dim)
+        self.offset_mlp = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU() if activation == 'gelu' else nn.ReLU(),
+            nn.Linear(embed_dim, num_samples * 2),
+        )
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        self.distance_penalty = nn.Parameter(torch.ones(1), requires_grad=True)
+        self.dropout = nn.Dropout(dropout)
+
+        self.pre_fc_norm = nn.LayerNorm(embed_dim)
+        self.fc1 = nn.Linear(embed_dim, embed_dim * 2)
+        self.act = nn.GELU() if activation == 'gelu' else nn.ReLU()
+        self.act_dropout = nn.Dropout(activation_dropout)
+        self.post_fc_norm = nn.LayerNorm(embed_dim * 2)
+        self.fc2 = nn.Linear(embed_dim * 2, embed_dim)
+
+    def forward(self, x: torch.Tensor, grid_context: dict, pad: torch.Tensor | None = None) -> torch.Tensor:
+        grid = grid_context["grid"]
+        base_coords = grid_context["sample_coords"]
+        B, P, _ = x.shape
+
+        x_norm = self.pre_attn_norm(x)
+        offsets = self.offset_mlp(x_norm).view(B, P, self.num_samples, 2)
+        step_x = 2.0 / max(grid_context["quantized"]["width"] - 1, 1)
+        step_y = 2.0 / max(grid_context["quantized"]["height"] - 1, 1)
+        step = x.new_tensor([self.offset_scale * step_x, self.offset_scale * step_y]).view(1, 1, 1, 2)
+        sample_coords = (base_coords.unsqueeze(2) + torch.tanh(offsets) * step).clamp(-1.0, 1.0)
+
+        sampled = F.grid_sample(
+            grid,
+            sample_coords,
+            mode='bilinear',
+            padding_mode='zeros',
+            align_corners=True,
+        )
+        sampled = sampled.permute(0, 2, 3, 1).contiguous()
+
+        q = self.q_proj(x_norm).view(B, P, self.num_heads, self.head_dim)
+        k = self.k_proj(sampled).view(B, P, self.num_samples, self.num_heads, self.head_dim)
+        v = self.v_proj(sampled).view(B, P, self.num_samples, self.num_heads, self.head_dim)
+        attn_logits = (q.unsqueeze(2) * k).sum(dim=-1) / math.sqrt(self.head_dim)
+        distance_bias = (sample_coords - base_coords.unsqueeze(2)).square().sum(dim=-1, keepdim=True)
+        attn_logits = attn_logits - self.distance_penalty.abs() * distance_bias
+
+        if pad is not None:
+            invalid_queries = pad.unsqueeze(-1).unsqueeze(-1)
+            attn_logits = torch.where(invalid_queries, torch.zeros_like(attn_logits), attn_logits)
+
+        attn = torch.softmax(attn_logits, dim=2)
+        if pad is not None:
+            attn = attn.masked_fill(invalid_queries, 0.0)
+
+        out = (attn.unsqueeze(-1) * v).sum(dim=2).reshape(B, P, self.embed_dim)
+        out = self.out_proj(out)
+        if pad is not None:
+            out = out.masked_fill(pad.unsqueeze(-1), 0.0)
+        x = x + self.dropout(out)
+
+        residual = x
+        x = self.pre_fc_norm(x)
+        x = self.act(self.fc1(x))
+        x = self.act_dropout(x)
+        x = self.post_fc_norm(x)
+        x = self.fc2(x)
+        x = residual + self.dropout(x)
+        if pad is not None:
+            x = x.masked_fill(pad.unsqueeze(-1), 0.0)
+        return x
 
 def compute_eta_phi_from_p4(v: torch.Tensor, eps: float = 1e-8):
     """
@@ -603,6 +894,11 @@ class ParticleTransformer(nn.Module):
                  use_amp=False,
                  gmp_coords = "raw",
                  use_gmp = False,
+                 use_gpca = False,
+                 gpca_layers = 1,
+                 use_sada = False,
+                 sada_num_samples = 8,
+                 sada_offset_scale = 2.0,
                  gmp_kernel = 3,
                  gmp_grid = 0.2,
                  gmp_reduce = "sum",
@@ -617,7 +913,15 @@ class ParticleTransformer(nn.Module):
 
         self.gmp_coords = gmp_coords
         self.use_gmp = use_gmp
+        self.use_gpca = use_gpca
+        self.use_sada = use_sada
         self.gmp = None
+        self.gpca = None
+        self.sada = None
+
+        if (self.use_gpca or self.use_sada) and not self.use_gmp:
+            raise ValueError("GPCA and SADA currently require use_gmp=True so they can reuse the GMP grid context.")
+
         if self.use_gmp:
             self.gmp = GeometricMessagePassing(
                 channels=embed_dim,
@@ -626,7 +930,10 @@ class ParticleTransformer(nn.Module):
                 scatter_reduce=gmp_reduce,
             )
 
-        _logger.info(f"GMP ENABLED: use_gmp={use_gmp}, grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}")
+        _logger.info(
+            f"GMP ENABLED: use_gmp={use_gmp}, use_gpca={use_gpca}, use_sada={use_sada}, "
+            f"grid={gmp_grid}, coords={gmp_coords}, kernel={gmp_kernel}"
+        )
 
         default_cfg = dict(embed_dim=embed_dim, num_heads=num_heads, ffn_ratio=4,
                            dropout=0.1, attn_dropout=0.1, activation_dropout=0.1,
@@ -642,6 +949,27 @@ class ParticleTransformer(nn.Module):
         if cls_block_params is not None:
             cfg_cls_block.update(cls_block_params)
         _logger.info('cfg_cls_block: %s' % str(cfg_cls_block))
+
+        if self.use_gpca:
+            self.gpca = GridParticleCrossAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_layers=gpca_layers,
+                dropout=cfg_block['dropout'],
+                attn_dropout=cfg_block['attn_dropout'],
+                activation_dropout=cfg_block['activation_dropout'],
+                activation=activation,
+            )
+        if self.use_sada:
+            self.sada = SubstructureAwareDeformableAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_samples=sada_num_samples,
+                offset_scale=sada_offset_scale,
+                dropout=cfg_block['dropout'],
+                activation_dropout=cfg_block['activation_dropout'],
+                activation=activation,
+            )
 
         self.pair_extra_dim = pair_extra_dim
         self.embed = Embed(input_dim, embed_dims, activation=activation) if len(embed_dims) > 0 else nn.Identity()
@@ -691,7 +1019,7 @@ class ParticleTransformer(nn.Module):
             # input embedding
             x = self.embed(x).masked_fill(~mask.permute(2, 0, 1), 0)  # (P, N, C)
 
-            if self.gmp is not None:
+            if self.gmp is not None or self.gpca is not None or self.sada is not None:
                 x_bpc = x.permute(1, 0, 2).contiguous()  # (N,P,C)
                 pad = ~mask.squeeze(1)                   # (N,P) True where padded
                 if self.gmp_coords in ("raw", "pt"):
@@ -716,7 +1044,22 @@ class ParticleTransformer(nn.Module):
                 else:
                     raise ValueError(f"Unsupported gmp_coords={self.gmp_coords}. Use one of: raw, pt, points, xy.")
 
-                x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
+                grid_context = None
+                if self.gmp is not None:
+                    if self.gpca is not None or self.sada is not None:
+                        x_bpc, grid_context = self.gmp(
+                            x_bpc,
+                            c1,
+                            c2,
+                            pad=pad,
+                            return_context=True,
+                        )
+                    else:
+                        x_bpc = self.gmp(x_bpc, c1, c2, pad=pad)
+                if self.gpca is not None:
+                    x_bpc = self.gpca(x_bpc, grid_context, pad=pad)
+                if self.sada is not None:
+                    x_bpc = self.sada(x_bpc, grid_context, pad=pad)
                 x = x_bpc.permute(1, 0, 2).contiguous()  # back to (P,N,C)
             
             if v is not None and self.pair_embed is not None:
@@ -771,6 +1114,11 @@ class ParticleTransformerTagger(nn.Module):
                  for_inference=False,
                  use_amp=False,
                  use_gmp = False,
+                 use_gpca = False,
+                 gpca_layers = 1,
+                 use_sada = False,
+                 sada_num_samples = 8,
+                 sada_offset_scale = 2.0,
                  gmp_coords = "raw",
                  gmp_kernel = 3,
                  gmp_grid = 0.05,
@@ -807,6 +1155,11 @@ class ParticleTransformerTagger(nn.Module):
                                         for_inference=for_inference,
                                         use_amp=use_amp,
                                         use_gmp=use_gmp,
+                                        use_gpca=use_gpca,
+                                        gpca_layers=gpca_layers,
+                                        use_sada=use_sada,
+                                        sada_num_samples=sada_num_samples,
+                                        sada_offset_scale=sada_offset_scale,
                                         gmp_coords=gmp_coords,
                                         gmp_kernel=gmp_kernel,
                                         gmp_grid=gmp_grid,
@@ -859,6 +1212,16 @@ class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
                  trim=True,
                  for_inference=False,
                  use_amp=False,
+                 use_gmp = False,
+                 use_gpca = False,
+                 gpca_layers = 1,
+                 use_sada = False,
+                 sada_num_samples = 8,
+                 sada_offset_scale = 2.0,
+                 gmp_coords = "raw",
+                 gmp_kernel = 3,
+                 gmp_grid = 0.05,
+                 gmp_reduce = "sum",
                  **kwargs) -> None:
         super().__init__(**kwargs)
 
@@ -890,7 +1253,17 @@ class ParticleTransformerTaggerWithExtraPairFeatures(nn.Module):
                                         # misc
                                         trim=False,
                                         for_inference=for_inference,
-                                        use_amp=use_amp)
+                                        use_amp=use_amp,
+                                        use_gmp=use_gmp,
+                                        use_gpca=use_gpca,
+                                        gpca_layers=gpca_layers,
+                                        use_sada=use_sada,
+                                        sada_num_samples=sada_num_samples,
+                                        sada_offset_scale=sada_offset_scale,
+                                        gmp_coords=gmp_coords,
+                                        gmp_kernel=gmp_kernel,
+                                        gmp_grid=gmp_grid,
+                                        gmp_reduce=gmp_reduce)
 
     @torch.jit.ignore
     def no_weight_decay(self):
