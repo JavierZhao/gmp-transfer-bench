@@ -97,6 +97,24 @@ fi
 # currently only Pythia
 SAMPLE_TYPE=Pythia
 
+EXTRA_ARGS=("${@:3}")
+for ((i=0; i<${#EXTRA_ARGS[@]}; i++)); do
+    arg="${EXTRA_ARGS[$i]}"
+    if [[ "$arg" == "--num-workers" && $((i + 1)) -lt ${#EXTRA_ARGS[@]} ]]; then
+        value="${EXTRA_ARGS[$((i + 1))]}"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value < 1 )); then
+            echo "Clamping --num-workers ${value} to 1 because weaver uses persistent_workers."
+            EXTRA_ARGS[$((i + 1))]=1
+        fi
+    elif [[ "$arg" == --num-workers=* ]]; then
+        value="${arg#--num-workers=}"
+        if [[ "$value" =~ ^[0-9]+$ ]] && (( value < 1 )); then
+            echo "Clamping ${arg} to --num-workers=1 because weaver uses persistent_workers."
+            EXTRA_ARGS[$i]="--num-workers=1"
+        fi
+    fi
+done
+
 $CMD \
     --data-train \
     "HToBB:${DATADIR}/${SAMPLE_TYPE}/train_100M/HToBB_*.root" \
@@ -127,4 +145,4 @@ $CMD \
     --samples-per-epoch ${samples_per_epoch} --samples-per-epoch-val ${samples_per_epoch_val} --num-epochs $epochs --gpus 0 \
     --optimizer ranger --log logs/JetClass_${SAMPLE_TYPE}_${FEATURE_TYPE}_${model}_{auto}${suffix}.log --predict-output pred.root \
     --tensorboard JetClass_${SAMPLE_TYPE}_${FEATURE_TYPE}_${model}${suffix} \
-    "${@:3}"
+    "${EXTRA_ARGS[@]}"
